@@ -561,33 +561,46 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
                //Perform some pre-processing on the waveform.
                std::shared_ptr< std::vector<float> > out = std::make_shared< std::vector<float> >(total_samples);
 
-               //TODO: Implement overlap / cross-fade for each chunk that we process.
-               //TODO: Allow up to 3 chunks to be passed in at once, as there are 3 distinct stages that can run in parallel.
-               size_t n_chunks = total_samples / _audioSR->nchunk_samples();
-               if (total_samples % _audioSR->nchunk_samples() != 0)
+               double crossfade_overlap_seconds = 0.1;
+
+               size_t overlap_samples = (size_t)(48000.0 * crossfade_overlap_seconds);
+               std::vector< std::pair<size_t, size_t> > segments;
+
                {
-                  n_chunks++;
+                  size_t current_sample = 0;
+                  size_t nchunk_samples = _audioSR->nchunk_samples();
+                  while (current_sample < total_samples)
+                  {
+                     if (current_sample != 0)
+                     {
+                        current_sample -= overlap_samples;
+                     }
+
+                     std::pair<size_t, size_t> segment = { current_sample,
+                       std::min(total_samples - current_sample, nchunk_samples) };
+
+                     segments.push_back(segment);
+
+                     current_sample += nchunk_samples;
+                  }
                }
+
+               int ddim_steps = 50;
 
                CallbackParams callback_params;
                callback_params.callback = AudioSRCallback;
                callback_params.user = this;
 
-               int ddim_steps = 50;
-
                _ddim_steps_complete = 0;
-               _total_ddim_steps = ddim_steps * n_chunks;
+               _total_ddim_steps = ddim_steps * segments.size();
 
-               for (size_t chunki = 0; chunki < n_chunks; chunki++)
+               for (size_t segmenti = 0; segmenti < segments.size(); segmenti++)
                {
-                  size_t offset = chunki * _audioSR->nchunk_samples();
-
-                  size_t nsamples = std::min(_audioSR->nchunk_samples(), total_samples - offset);
+                  size_t offset = segments[segmenti].first;
+                  size_t nsamples = segments[segmenti].second;
 
                   //calculate RMS
                   auto input_rms = calc_rms(entire_input.get() + offset, nsamples);
-                  std::cout << "input_rms = " << input_rms << std::endl;
-                  
 
                   Batch batch;
                   _audioSR->normalize_and_pad(entire_input.get() + offset, nsamples, batch);
@@ -596,8 +609,8 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
                   // START OF LOWPASS FILTER
                   //TODO: wrap this into a helper function so that it doesn't muddy the overall flow so much.
                   float* pNormalizedWaveform = batch.waveform.data_ptr<float>();
-                  int64_t npadded_samples = batch.waveform.size(-1);
 
+                  int64_t npadded_samples = batch.waveform.size(-1);
 
                   // We need to apply a lowpass filter to the normalized.
                   auto filtered = sos_lowpass_filter(pNormalizedWaveform, npadded_samples, batch.cutoff_freq, 48000.0);
@@ -652,10 +665,36 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
                      }
                   }
 
-                  std::memcpy(out->data() + offset, waveform_sr.data_ptr(), nsamples * sizeof(float));
-               }
+                  //first (or only) segment. No crossfade for this one.
+                  if (segmenti == 0)
+                  {
+                     std::memcpy(out->data() + offset, waveform_sr.data_ptr(), nsamples * sizeof(float));
+                  }
+                  else
+                  {
+                     float* pOutputCrossfadeStart = out->data() + offset;
+                     float* pNewWaveform = (float *)waveform_sr.data_ptr();
 
-               //std::memcpy(out->data(), entire_input.get(), total_samples * sizeof(float));
+                     auto crossfade_samples = std::min(overlap_samples, nsamples);
+                     std::cout << "cross-fading " << crossfade_samples << " samples..." << std::endl;
+
+                     float fade_step = 1.f / (float)(overlap_samples);
+                     size_t outputi;
+                     for (outputi = 0; (outputi < crossfade_samples); outputi++)
+                     {
+                        float fade = pOutputCrossfadeStart[outputi] * (1 - outputi * fade_step) +
+                           pNewWaveform[outputi] * (outputi * fade_step);
+
+                        pOutputCrossfadeStart[outputi] = fade;
+                     }
+
+                     size_t samples_left = nsamples - outputi;
+                     if (samples_left)
+                     {
+                        std::memcpy(pOutputCrossfadeStart + outputi, pNewWaveform + outputi, samples_left * sizeof(float));
+                     }
+                  }
+               }
 
                output_channels.push_back(out);
             }
