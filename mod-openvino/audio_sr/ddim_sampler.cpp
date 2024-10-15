@@ -218,6 +218,7 @@ void DDIMSampler::_make_schedule(int64_t ddim_num_steps, double ddim_eta)
 torch::Tensor DDIMSampler::sample(int64_t ddim_num_steps,
     torch::Tensor conditioning,
     double unconditional_guidance_scale,
+   torch::Generator &gen,
     std::optional< torch::Tensor > unconditional_conditioning,
    std::optional< CallbackParams > callback_params)
 {
@@ -232,9 +233,7 @@ torch::Tensor DDIMSampler::sample(int64_t ddim_num_steps,
     //ddim_sampling starts here.
     size_t b = 1;
 
-    //TODO: Remove this! We should use a generator.
-    torch::manual_seed(0);
-    auto img = torch::randn(shape);
+    auto img = torch::randn(shape, gen);
 
     auto timesteps = _ddim_timesteps;
 
@@ -250,7 +249,7 @@ torch::Tensor DDIMSampler::sample(int64_t ddim_num_steps,
         std::cout << "step = " << step.item<int64_t>() << std::endl;
 
         auto sample_ddim_ret = _p_sample_ddim(img, conditioning, step.item<int64_t>(), index,
-           unconditional_guidance_scale, unconditional_conditioning, callback_params);
+           unconditional_guidance_scale, gen, unconditional_conditioning, callback_params);
 
         img = sample_ddim_ret.first;
         auto pred_x0 = sample_ddim_ret.second;
@@ -300,6 +299,7 @@ torch::Tensor DDIMSampler::_predict_start_from_z_and_v(torch::Tensor x_t, torch:
 
 std::pair<torch::Tensor, torch::Tensor> DDIMSampler::_p_sample_ddim(torch::Tensor x, torch::Tensor c, int64_t t, int64_t index,
     double unconditional_guidance_scale,
+    torch::Generator &gen,
     std::optional< torch::Tensor > unconditional_conditioning,
     std::optional< CallbackParams > callback_params)
 {
@@ -351,7 +351,7 @@ std::pair<torch::Tensor, torch::Tensor> DDIMSampler::_p_sample_ddim(torch::Tenso
     auto dir_xt = (1.0 - a_prev - sigma_t.pow(2)).sqrt() * e_t;
 
     //TODO: use generator for randn
-    auto noise = sigma_t * torch::randn(x.sizes()) * temperature;
+    auto noise = sigma_t * torch::randn(x.sizes(), gen) * temperature;
 
     auto x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise;
 

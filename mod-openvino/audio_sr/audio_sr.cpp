@@ -225,15 +225,65 @@ torch::Tensor AudioSR::run_audio_sr(Batch& batch,
    std::optional< CallbackParams > callback_params
 )
 {
+   auto intermediate = run_audio_sr_stage1(batch, seed);
+
+   intermediate = run_audio_sr_stage2(intermediate, unconditional_guidance_scale, ddim_steps, seed, callback_params);
+
+   return run_audio_sr_stage3(intermediate, batch);
+}
+
+struct AudioSR::AudioSRIntermediate
+{
+   std::shared_ptr< DDPMLatentDiffusion::DDPMLatentDiffusionIntermediate > intermediate;
+};
+
+std::shared_ptr< AudioSR::AudioSRIntermediate > AudioSR::run_audio_sr_stage1(Batch& batch, int64_t seed)
+{
+   auto intermediate = std::make_shared< AudioSR::AudioSRIntermediate >();
+
    auto lowpass_feature_extraction_ret = _wav_feature_extraction(batch.waveform_lowpass, batch.target_frame);
 
    batch.lowpass_mel = lowpass_feature_extraction_ret.first.unsqueeze(0);
    batch.waveform_lowpass = batch.waveform_lowpass.unsqueeze(0);
 
-   //TODO: use a generator instance instead of relying on global
-   torch::manual_seed(seed);
+   intermediate->intermediate = _ddpm_latent_diffusion->generate_batch_stage1(batch, seed);
 
-   auto sr_waveform = _ddpm_latent_diffusion->generate_batch(batch, ddim_steps, unconditional_guidance_scale, callback_params);
+   return intermediate;
+}
 
-   return sr_waveform;
+std::shared_ptr< AudioSR::AudioSRIntermediate > AudioSR::run_audio_sr_stage2(std::shared_ptr< AudioSR::AudioSRIntermediate > intermediate,
+   double unconditional_guidance_scale,
+   int ddim_steps,
+   int64_t seed,
+   std::optional< CallbackParams > callback_params)
+{
+   if (!intermediate)
+   {
+      throw std::runtime_error("AudioSR::run_audio_sr_stage2: intermediate is null!");
+   }
+
+   if (!intermediate->intermediate)
+   {
+      throw std::runtime_error("AudioSR::run_audio_sr_stage2: latent diffusion intermediate is null!");
+   }
+
+   intermediate->intermediate = _ddpm_latent_diffusion->generate_batch_stage2(intermediate->intermediate,
+      ddim_steps, unconditional_guidance_scale, callback_params);
+
+   return intermediate; 
+}
+
+torch::Tensor AudioSR::run_audio_sr_stage3(std::shared_ptr< AudioSR::AudioSRIntermediate > intermediate, Batch& batch)
+{
+   if (!intermediate)
+   {
+      throw std::runtime_error("AudioSR::run_audio_sr_stage3: intermediate is null!");
+   }
+
+   if (!intermediate->intermediate)
+   {
+      throw std::runtime_error("AudioSR::run_audio_sr_stage3: latent diffusion intermediate is null!");
+   }
+
+   return _ddpm_latent_diffusion->generate_batch_stage3(intermediate->intermediate, batch);
 }

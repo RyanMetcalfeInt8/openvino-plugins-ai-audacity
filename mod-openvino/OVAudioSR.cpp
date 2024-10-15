@@ -330,6 +330,97 @@ static inline double calc_rms( float *pSamples, size_t nsamples )
    return rms;
 }
 
+static inline std::shared_ptr< std::vector<float> > normalize_pad_lowpass(float* pInput, size_t nsamples, WaveTrack::Holder pTrack, std::shared_ptr<AudioSR> audioSR, Batch& batch)
+{
+   audioSR->normalize_and_pad(pInput, nsamples, batch);
+
+   // Take the normalized waveform, and apply a lowpass filter to it, using the cutoff.
+   // START OF LOWPASS FILTER
+   float* pNormalizedWaveform = batch.waveform.data_ptr<float>();
+
+   int64_t npadded_samples = batch.waveform.size(-1);
+
+   // We need to apply a lowpass filter to the normalized.
+   auto filtered = sos_lowpass_filter(pNormalizedWaveform, npadded_samples, batch.cutoff_freq, 48000.0);
+
+   auto pTmpTrack = pTrack->EmptyCopy();
+   pTmpTrack->MakeMono();
+
+   auto iter =
+      pTmpTrack->Channels().begin();
+
+   auto& tmpLeft = **iter++;
+   tmpLeft.Append((samplePtr)filtered->data(), floatSample, npadded_samples);
+
+   pTmpTrack->Flush();
+
+   //apply a hard lowpass filter.
+   double nyquist = 48000.0 / 2.0;
+   double lowpass_ratio = batch.cutoff_freq / nyquist;
+
+   int fs_down = int(lowpass_ratio * 48000.0);
+
+   std::cout << "Resamping to " << fs_down << " hz." << std::endl;
+   // downsample
+   pTmpTrack->Resample(fs_down);
+
+   std::cout << "Resamping back to " << 48000 << " hz." << std::endl;
+   // and upsample
+   pTmpTrack->Resample(48000);
+
+   auto pChannel = pTmpTrack->GetChannel(0);
+
+   pChannel->GetFloats(filtered->data(), 0, npadded_samples);
+
+   auto filtered_again = sos_lowpass_filter(filtered->data(), npadded_samples, batch.cutoff_freq, 48000.0);
+
+   return filtered_again;
+}
+
+struct OVAudioSRIntermediate
+{
+   //stage 1
+   double input_rms;
+
+   Batch batch;
+   std::shared_ptr< std::vector<float> > lowpass_filtered;
+
+   std::shared_ptr<AudioSR> audioSR;
+
+   std::shared_ptr< AudioSR::AudioSRIntermediate > intermediate;
+
+   int64_t seed;
+
+   
+};
+
+static std::shared_ptr< OVAudioSRIntermediate > run_audiosr_stage1(float* pInput, size_t nsamples, WaveTrack::Holder pTrack, std::shared_ptr<AudioSR> audioSR, int64_t seed)
+{
+   auto intermediate = std::make_shared< OVAudioSRIntermediate >();
+
+   intermediate->audioSR = audioSR;
+   intermediate->seed = seed;
+   intermediate->input_rms = calc_rms(pInput, nsamples);
+   intermediate->lowpass_filtered = normalize_pad_lowpass(pInput, nsamples, pTrack, intermediate->audioSR, intermediate->batch);
+   intermediate->batch.waveform_lowpass = torch::from_blob((void*)intermediate->lowpass_filtered->data(), { 1, static_cast<long>(intermediate->lowpass_filtered->size()) }, torch::kFloat);
+   intermediate->intermediate = audioSR->run_audio_sr_stage1(intermediate->batch, seed);
+
+   return intermediate;
+}
+
+
+static std::shared_ptr< OVAudioSRIntermediate > run_audiosr_stage2(std::shared_ptr< OVAudioSRIntermediate > intermediate, double unconditional_guidance_scale = 3.5, int ddim_steps = 50, std::optional< CallbackParams > callback_params = {})
+{
+   intermediate->intermediate = intermediate->audioSR->run_audio_sr_stage2(intermediate->intermediate, unconditional_guidance_scale, ddim_steps, intermediate->seed, callback_params);
+
+   return intermediate;
+}
+
+static torch::Tensor run_audiosr_stage3(std::shared_ptr< OVAudioSRIntermediate > intermediate)
+{
+   return intermediate->audioSR->run_audio_sr_stage3(intermediate->intermediate, intermediate->batch);
+}
+
 bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
 {
    try
@@ -585,7 +676,10 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
                   }
                }
 
+               //TODO: Hook these up to the UI
                int ddim_steps = 50;
+               int64_t seed = 42;
+               double unconditional_guidance_scale = 3.5;
 
                CallbackParams callback_params;
                callback_params.callback = AudioSRCallback;
@@ -599,57 +693,11 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
                   size_t offset = segments[segmenti].first;
                   size_t nsamples = segments[segmenti].second;
 
-                  //calculate RMS
-                  auto input_rms = calc_rms(entire_input.get() + offset, nsamples);
+                  auto intermediate = run_audiosr_stage1(entire_input.get() + offset, nsamples, pTrack, _audioSR, seed);
+                  intermediate = run_audiosr_stage2(intermediate, unconditional_guidance_scale, ddim_steps, callback_params);
+                  auto waveform_sr = run_audiosr_stage3(intermediate);
 
-                  Batch batch;
-                  _audioSR->normalize_and_pad(entire_input.get() + offset, nsamples, batch);
-
-                  // Take the normalized waveform, and apply a lowpass filter to it, using the cutoff.
-                  // START OF LOWPASS FILTER
-                  //TODO: wrap this into a helper function so that it doesn't muddy the overall flow so much.
-                  float* pNormalizedWaveform = batch.waveform.data_ptr<float>();
-
-                  int64_t npadded_samples = batch.waveform.size(-1);
-
-                  // We need to apply a lowpass filter to the normalized.
-                  auto filtered = sos_lowpass_filter(pNormalizedWaveform, npadded_samples, batch.cutoff_freq, 48000.0);
-
-                  auto pTmpTrack = pTrack->EmptyCopy();
-                  pTmpTrack->MakeMono();
-
-                  auto iter =
-                     pTmpTrack->Channels().begin();
-
-                  auto& tmpLeft = **iter++;
-                  tmpLeft.Append((samplePtr)filtered->data(), floatSample, npadded_samples);
-
-                  pTmpTrack->Flush();
-
-                  //apply a hard lowpass filter.
-                  double nyquist = 48000.0 / 2.0;
-                  double lowpass_ratio = batch.cutoff_freq / nyquist;
-
-                  int fs_down = int(lowpass_ratio * 48000.0);
-
-                  std::cout << "Resamping to " << fs_down << " hz." << std::endl;
-                  // downsample
-                  pTmpTrack->Resample(fs_down);
-
-                  std::cout << "Resamping back to " << 48000 << " hz." << std::endl;
-                  // and upsample
-                  pTmpTrack->Resample(48000);
-
-                  auto pChannel = pTmpTrack->GetChannel(0);
-
-                  pChannel->GetFloats(filtered->data(), 0, npadded_samples);
-
-                  auto filtered_again = sos_lowpass_filter(filtered->data(), npadded_samples, batch.cutoff_freq, 48000.0);
-
-                  //END OF LOWPASS FILTER
-                  batch.waveform_lowpass = torch::from_blob((void*)filtered_again->data(), { 1, static_cast<long>(filtered_again->size()) }, torch::kFloat);
-
-                  auto waveform_sr = _audioSR->run_audio_sr(batch, 3.5, ddim_steps, 42, callback_params);
+                  auto input_rms = intermediate->input_rms;
 
                   auto output_rms = calc_rms((float*)waveform_sr.data_ptr(), nsamples);
                   std::cout << "output_rms = " << input_rms << std::endl;

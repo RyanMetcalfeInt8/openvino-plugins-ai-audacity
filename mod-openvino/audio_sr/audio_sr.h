@@ -25,8 +25,21 @@ public:
       std::optional< CallbackParams > callback_params = {}
       );
 
+   struct AudioSRIntermediate;
+   std::shared_ptr< AudioSRIntermediate > run_audio_sr_stage1(Batch& batch,
+      int64_t seed = 42);
+
+   std::shared_ptr< AudioSRIntermediate > run_audio_sr_stage2(std::shared_ptr< AudioSRIntermediate > intermediate,
+      double unconditional_guidance_scale = 3.5,
+      int ddim_steps = 50,
+      int64_t seed = 42,
+      std::optional< CallbackParams > callback_params = {});
+
+
+   torch::Tensor run_audio_sr_stage3(std::shared_ptr< AudioSRIntermediate > intermediate, Batch& batch);
+
    // How many samples we apply super res pipeline to at once.
-   size_t nchunk_samples() { return 491520; };
+   size_t nchunk_samples() { return 491520; }; //<- 491520 == 10.24 seconds @ 48 khz
 
    AudioSR_Config config()
    {

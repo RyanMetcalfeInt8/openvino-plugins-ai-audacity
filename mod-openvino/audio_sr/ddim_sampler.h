@@ -13,6 +13,7 @@ public:
     torch::Tensor sample(int64_t ddim_num_steps,
         torch::Tensor conditioning,
         double unconditional_guidance_scale,
+        torch::Generator &gen,
         std::optional< torch::Tensor > unconditional_conditioning,
         std::optional< CallbackParams > callback_params = {});
 
@@ -25,6 +26,7 @@ private:
 
     std::pair<torch::Tensor, torch::Tensor> _p_sample_ddim(torch::Tensor x, torch::Tensor c, int64_t t, int64_t index,
         double unconditional_guidance_scale,
+        torch::Generator &gen,
         std::optional< torch::Tensor > unconditional_conditioning,
         std::optional< CallbackParams > callback_params = {});
 

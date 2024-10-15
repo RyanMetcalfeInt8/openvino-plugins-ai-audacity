@@ -84,7 +84,7 @@ void DDPMLatentDiffusion::set_config(AudioSR_Config config)
    }
 }
 
-std::pair<torch::Tensor, torch::Tensor> DDPMLatentDiffusion::_get_input(Batch& batch)
+std::pair<torch::Tensor, torch::Tensor> DDPMLatentDiffusion::_get_input(Batch& batch, torch::Generator &gen)
 {
     //in LatentDiffusion get_input() first does x = super().get_input(batch, "fbank").
     // and super (DDPM) get_input does:
@@ -102,13 +102,10 @@ std::pair<torch::Tensor, torch::Tensor> DDPMLatentDiffusion::_get_input(Batch& b
     // And so, it essentially returns: batch["log_mel_spec"].unsqueeze(1).to(memory_format = torch.contiguous_format).float()
     auto x = batch.log_mel_spec.unsqueeze(1).to(torch::kFloat).contiguous();
 
-    auto z = _get_first_stage_encoding(x);
-    //dump_tensor(z, "z_from_first_stage_encoding_ov.raw");
+    auto z = _get_first_stage_encoding(x, gen);
 
     // xc = super().get_input(batch, "lowpass_mel")
     auto xc = batch.lowpass_mel;
-
-    //std::cout << "xc.shape = " << xc.sizes() << std::endl;
 
     torch::Tensor c;
     {
@@ -121,9 +118,6 @@ std::pair<torch::Tensor, torch::Tensor> DDPMLatentDiffusion::_get_input(Batch& b
         _vae_feature_extract_infer.infer();
         c = wrap_ov_tensor_as_torch(_vae_feature_extract_infer.get_output_tensor());
     }
-
-    //dump_tensor(c, "c_ov.raw");
-    //std::cout << "c.shape = " << c.sizes() << std::endl;
 
     return { z, c };
 }
@@ -220,68 +214,136 @@ static torch::Tensor postprocessing(torch::Tensor out_batch, torch::Tensor x_bat
     return out_batch;
 }
 
-torch::Tensor DDPMLatentDiffusion::generate_batch(Batch& batch, int64_t ddim_steps, double unconditional_guidance_scale,
-   std::optional< CallbackParams > callback_params)
+struct DDPMLatentDiffusion::DDPMLatentDiffusionIntermediate
 {
-    auto duration = batch.duration;
-    double ddim_eta = 1.0;
+   //common across stages
+   torch::Generator gen;
 
-    auto input = _get_input(batch);
+   //stage 1 output
+   torch::Tensor input_z;
+   torch::Tensor input_c;
 
-    auto z = input.first;
-    auto c = input.second;
-    _latent_t_size = z.size(-2);
+   //stage 2 output
+   torch::Tensor samples;
+   
+};
 
-    std::optional< torch::Tensor > unconditional_cond;
-    if (unconditional_guidance_scale != 1.0)
-    {
-        // In the python version, this is created inside VAEFeatureExtract, using:
-        // self.unconditional_cond = -11.4981 + vae_embed[0].clone() * 0.0.
-        unconditional_cond = torch::full(c.sizes(), -11.4981);
-    }
+std::shared_ptr< DDPMLatentDiffusion::DDPMLatentDiffusionIntermediate > DDPMLatentDiffusion::generate_batch_stage1(Batch& batch, int64_t seed)
+{
+   auto intermediate = std::make_shared< DDPMLatentDiffusionIntermediate >();
 
-    auto samples = _sampler->sample(ddim_steps, c, unconditional_guidance_scale, unconditional_cond, callback_params);
+   intermediate->gen = at::detail::createCPUGenerator();
+   intermediate->gen.set_current_seed(seed);
 
-    //dump_tensor(samples, "samples_ov.raw");
+   auto input = _get_input(batch, intermediate->gen);
 
-    auto mel = _decode_first_stage(samples);
+   intermediate->input_z = input.first;
+   intermediate->input_c = input.second;
 
-    mel = _mel_replace_ops(mel, batch.lowpass_mel);
-
-    //dump_tensor(mel, "mel_ov.raw");
-
-    auto waveform = _mel_spectrogram_to_waveform(mel);
-
-    //dump_tensor(waveform, "waveform_ov.raw");
-
-    waveform = postprocessing(waveform, batch.waveform_lowpass);
-
-    //dump_tensor(waveform, "waveform_pp_ov.raw");
-
-    //auto max_amp = torch::max(torch::abs(waveform), -1);
-
-    // Get the maximum amplitude along the last axis
-    auto max_amp_ret = torch::max(torch::abs(waveform), /*dim=*/-1, /*keepdim=*/true);
-    torch::Tensor max_amp = std::get<0>(max_amp_ret);
-
-    // Normalize waveform by maximum amplitude, scale by 0.5
-    waveform = 0.5 * waveform / max_amp;
-
-    // Compute the mean amplitude along the last axis and keep dimensions
-    torch::Tensor mean_amp = torch::mean(waveform, /*dim=*/-1, /*keepdim=*/true);
-
-    // Subtract mean amplitude from waveform
-    waveform = waveform - mean_amp;
-
-    //dump_tensor(waveform, "waveform_ret_ov.raw");
-
-    return waveform;
+   return intermediate;
 }
 
-torch::Tensor DDPMLatentDiffusion::_get_first_stage_encoding(torch::Tensor x)
+std::shared_ptr< DDPMLatentDiffusion::DDPMLatentDiffusionIntermediate > DDPMLatentDiffusion::generate_batch_stage2(std::shared_ptr< DDPMLatentDiffusion::DDPMLatentDiffusionIntermediate > intermediate,
+   int64_t ddim_steps, double unconditional_guidance_scale,
+   std::optional< CallbackParams > callback_params)
+{
+
+   if (!intermediate)
+   {
+      throw std::runtime_error("generate_batch_stage2: intermediate is null.");
+   }
+
+   if (!intermediate->input_c.defined())
+   {
+      throw std::runtime_error("generate_batch_stage2: C is not defined. make sure stage 1 was run.");
+   }
+
+   if (!intermediate->input_z.defined())
+   {
+      throw std::runtime_error("generate_batch_stage2: Z is not defined. make sure stage 1 was run.");
+   }
+
+   auto z = intermediate->input_z;
+   auto c = intermediate->input_c;
+
+   std::optional< torch::Tensor > unconditional_cond;
+   if (unconditional_guidance_scale != 1.0)
+   {
+      // In the python version, this is created inside VAEFeatureExtract, using:
+      // self.unconditional_cond = -11.4981 + vae_embed[0].clone() * 0.0.
+      unconditional_cond = torch::full(c.sizes(), -11.4981);
+   }
+
+   intermediate->samples = _sampler->sample(ddim_steps, c, unconditional_guidance_scale, intermediate->gen, unconditional_cond, callback_params);
+
+   return intermediate;
+}
+
+torch::Tensor DDPMLatentDiffusion::generate_batch_stage3(std::shared_ptr< DDPMLatentDiffusion::DDPMLatentDiffusionIntermediate > intermediate,
+   Batch& batch)
+{
+   if (!intermediate)
+   {
+      throw std::runtime_error("generate_batch_stage3: intermediate is null.");
+   }
+
+   if (!intermediate->samples.defined())
+   {
+      throw std::runtime_error("generate_batch_stage3: samples is not defined. make sure stage 2 was run.");
+   }
+
+   auto samples = intermediate->samples;
+
+   auto mel = _decode_first_stage(samples);
+
+   mel = _mel_replace_ops(mel, batch.lowpass_mel);
+
+   //dump_tensor(mel, "mel_ov.raw");
+
+   auto waveform = _mel_spectrogram_to_waveform(mel);
+
+   //dump_tensor(waveform, "waveform_ov.raw");
+
+   waveform = postprocessing(waveform, batch.waveform_lowpass);
+
+   //dump_tensor(waveform, "waveform_pp_ov.raw");
+
+   //auto max_amp = torch::max(torch::abs(waveform), -1);
+
+   // Get the maximum amplitude along the last axis
+   auto max_amp_ret = torch::max(torch::abs(waveform), /*dim=*/-1, /*keepdim=*/true);
+   torch::Tensor max_amp = std::get<0>(max_amp_ret);
+
+   // Normalize waveform by maximum amplitude, scale by 0.5
+   waveform = 0.5 * waveform / max_amp;
+
+   // Compute the mean amplitude along the last axis and keep dimensions
+   torch::Tensor mean_amp = torch::mean(waveform, /*dim=*/-1, /*keepdim=*/true);
+
+   // Subtract mean amplitude from waveform
+   waveform = waveform - mean_amp;
+
+   //dump_tensor(waveform, "waveform_ret_ov.raw");
+
+   return waveform;
+}
+
+torch::Tensor DDPMLatentDiffusion::generate_batch(Batch& batch, int64_t seed,
+   int64_t ddim_steps, double unconditional_guidance_scale,
+   std::optional< CallbackParams > callback_params)
+{
+   auto intermediate = generate_batch_stage1(batch, seed);
+
+   intermediate = generate_batch_stage2(intermediate, ddim_steps, unconditional_guidance_scale, callback_params);
+
+   return generate_batch_stage3(intermediate, batch);
+}
+
+
+torch::Tensor DDPMLatentDiffusion::_get_first_stage_encoding(torch::Tensor x, torch::Generator &gen)
 {
     auto encoder_posterior = _first_stage_encoder->encode(x);
-    auto z = encoder_posterior->sample();
+    auto z = encoder_posterior->sample(gen);
 
     return _scale_factor * z;
 }
