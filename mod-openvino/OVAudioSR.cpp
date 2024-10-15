@@ -10,11 +10,11 @@
 #include <iostream>
 #include <wx/log.h>
 
+#include "BasicUI.h"
 #include "ViewInfo.h"
 #include "TimeWarper.h"
 #include "LoadEffects.h"
 #include "audio_sr.h"
-#include "htdemucs.h"
 
 #include "biquad.h"
 
@@ -239,28 +239,21 @@ static bool AudioSRCallback(int ith_step_complete, void* user)
 
 bool EffectOVAudioSR::StepComplete(int ith_step)
 {
+   std::lock_guard<std::mutex> guard(mProgMutex);
+
    _ddim_steps_complete++;
    if (_total_ddim_steps > 0)
    {
-      double perc = (double)_ddim_steps_complete / (double)_total_ddim_steps;
-      if (TotalProgress(perc))
+      float perc = (float)_ddim_steps_complete / (float)_total_ddim_steps;
+      mProgressFrac = perc;
+
+      if (mIsCancelled)
       {
-         std::cout << "User cancelled!" << std::endl;
          return false;
       }
    }
 
-#if 0
-   //TotalProgress will return true if user clicks 'cancel'
-   if (TotalProgress(perc / 100.0))
-   {
-      std::cout << "User cancelled!" << std::endl;
-      return false;
-   }
-#endif
-
    return true;
-
 }
 
 static inline std::shared_ptr<std::vector<float>> sos_lowpass_filter(float *pIn, size_t nsamples, double cutoff, double fs)
@@ -460,7 +453,7 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
          auto device = mSupportedDevices[m_deviceSelectionChoice];
          AudioSR_Config config;
          config.first_stage_encoder_device = "GPU";
-         config.vae_feature_extract_device = "CPU";
+         config.vae_feature_extract_device = "GPU";
          config.ddpm__device = device;
          config.vocoder_device = "GPU";
          config.model_selection = m_modelSelectionChoice == 0 ? AudioSRModel::BASIC : AudioSRModel::SPEECH;
@@ -525,6 +518,11 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
 
 
       std::vector< WaveTrack::Holder > tracks_to_process;
+
+      //TODO: Hook these up to the UI
+      int ddim_steps = 50;
+      int64_t seed = 42;
+      double unconditional_guidance_scale = 3.5;
 
       //Create resampled copies of the selected portion of tracks. 
       // This prevents the Resample operation to modify the user's
@@ -633,15 +631,13 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
             size_t total_samples = (end - start).as_size_t();
             Floats entire_input{ total_samples * 2 };
 
-            TotalProgress(0.01, XO("Applying Audio Super Resolution using OpenVINO"));
-
             //Perform audio SR on each channel separately.
 
             std::vector< std::shared_ptr<std::vector<float>>> output_channels;
 
+            int channeli = 0;
             for (auto channel : channels_to_process)
             {
-
                bool bOkay = channel->GetFloats(entire_input.get(), start, total_samples);
                if (!bOkay)
                {
@@ -649,100 +645,136 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
                      std::to_string(total_samples) + " samples");
                }
 
-               //Perform some pre-processing on the waveform.
-               std::shared_ptr< std::vector<float> > out = std::make_shared< std::vector<float> >(total_samples);
+               mProgressFrac = 0.0;
 
-               double crossfade_overlap_seconds = 0.1;
-
-               size_t overlap_samples = (size_t)(48000.0 * crossfade_overlap_seconds);
-               std::vector< std::pair<size_t, size_t> > segments;
-
+               if (tracks_to_process.size() > 1)
                {
-                  size_t current_sample = 0;
-                  size_t nchunk_samples = _audioSR->nchunk_samples();
-                  while (current_sample < total_samples)
-                  {
-                     if (current_sample != 0)
-                     {
-                        current_sample -= overlap_samples;
-                     }
-
-                     std::pair<size_t, size_t> segment = { current_sample,
-                       std::min(total_samples - current_sample, nchunk_samples) };
-
-                     segments.push_back(segment);
-
-                     current_sample += nchunk_samples;
-                  }
+                  mProgMessage = "Running Super Resolution on track " + std::to_string(ti + 1) + " / " + std::to_string(tracks_to_process.size()) + ", channel " + std::to_string(channeli++);
+               }
+               else if (channels_to_process.size() > 1)
+               {
+                  mProgMessage = "Running Super Resolution on channel " + std::to_string(channeli++);
+               }
+               else
+               {
+                  mProgMessage = "Running Super Resolution";
                }
 
-               //TODO: Hook these up to the UI
-               int ddim_steps = 50;
-               int64_t seed = 42;
-               double unconditional_guidance_scale = 3.5;
-
-               CallbackParams callback_params;
-               callback_params.callback = AudioSRCallback;
-               callback_params.user = this;
-
-               _ddim_steps_complete = 0;
-               _total_ddim_steps = ddim_steps * segments.size();
-
-               for (size_t segmenti = 0; segmenti < segments.size(); segmenti++)
-               {
-                  size_t offset = segments[segmenti].first;
-                  size_t nsamples = segments[segmenti].second;
-
-                  auto intermediate = run_audiosr_stage1(entire_input.get() + offset, nsamples, pTrack, _audioSR, seed);
-                  intermediate = run_audiosr_stage2(intermediate, unconditional_guidance_scale, ddim_steps, callback_params);
-                  auto waveform_sr = run_audiosr_stage3(intermediate);
-
-                  auto input_rms = intermediate->input_rms;
-
-                  auto output_rms = calc_rms((float*)waveform_sr.data_ptr(), nsamples);
-                  std::cout << "output_rms = " << input_rms << std::endl;
-
-                  float ratio = input_rms / output_rms;
-
-                  //normalize loudness back to original RMS
+               auto audio_sr_channel_run_future = std::async(std::launch::async,
+                  [this, &entire_input, &total_samples , &ddim_steps, &seed, &unconditional_guidance_scale, &pTrack]
                   {
-                     float* pSamples = (float*)waveform_sr.data_ptr();
-                     for (size_t si = 0; si < nsamples; si++)
+                     std::shared_ptr< std::vector<float> > out = std::make_shared< std::vector<float> >(total_samples);
+
+                     // we overlap processed segments by 0.1 seconds, and then crossfade between them
+                     // to suppress transition artifacts.
+                     double crossfade_overlap_seconds = 0.1;
+
+                     size_t overlap_samples = (size_t)(48000.0 * crossfade_overlap_seconds);
+                     std::vector< std::pair<size_t, size_t> > segments;
+
                      {
-                        pSamples[si] *= ratio;
+                        size_t current_sample = 0;
+                        size_t nchunk_samples = _audioSR->nchunk_samples();
+                        while (current_sample < total_samples)
+                        {
+                           if (current_sample != 0)
+                           {
+                              current_sample -= overlap_samples;
+                           }
+
+                           std::pair<size_t, size_t> segment = { current_sample,
+                             std::min(total_samples - current_sample, nchunk_samples) };
+
+                           segments.push_back(segment);
+
+                           current_sample += nchunk_samples;
+                        }
+                     }
+
+                     CallbackParams callback_params;
+                     callback_params.callback = AudioSRCallback;
+                     callback_params.user = this;
+
+                     _ddim_steps_complete = 0;
+                     _total_ddim_steps = ddim_steps * segments.size();
+
+                     for (size_t segmenti = 0; segmenti < segments.size(); segmenti++)
+                     {
+                        size_t offset = segments[segmenti].first;
+                        size_t nsamples = segments[segmenti].second;
+
+                        auto intermediate = run_audiosr_stage1(entire_input.get() + offset, nsamples, pTrack, _audioSR, seed);
+                        intermediate = run_audiosr_stage2(intermediate, unconditional_guidance_scale, ddim_steps, callback_params);
+                        auto waveform_sr = run_audiosr_stage3(intermediate);
+
+                        auto input_rms = intermediate->input_rms;
+
+                        auto output_rms = calc_rms((float*)waveform_sr.data_ptr(), nsamples);
+                        std::cout << "output_rms = " << input_rms << std::endl;
+
+                        float ratio = input_rms / output_rms;
+
+                        //normalize loudness back to original RMS
+                        {
+                           float* pSamples = (float*)waveform_sr.data_ptr();
+                           for (size_t si = 0; si < nsamples; si++)
+                           {
+                              pSamples[si] *= ratio;
+                           }
+                        }
+
+                        //first (or only) segment. No crossfade for this one.
+                        if (segmenti == 0)
+                        {
+                           std::memcpy(out->data() + offset, waveform_sr.data_ptr(), nsamples * sizeof(float));
+                        }
+                        else
+                        {
+                           float* pOutputCrossfadeStart = out->data() + offset;
+                           float* pNewWaveform = (float*)waveform_sr.data_ptr();
+
+                           auto crossfade_samples = std::min(overlap_samples, nsamples);
+                           std::cout << "cross-fading " << crossfade_samples << " samples..." << std::endl;
+
+                           float fade_step = 1.f / (float)(overlap_samples);
+                           size_t outputi;
+                           for (outputi = 0; (outputi < crossfade_samples); outputi++)
+                           {
+                              float fade = pOutputCrossfadeStart[outputi] * (1 - outputi * fade_step) +
+                                 pNewWaveform[outputi] * (outputi * fade_step);
+
+                              pOutputCrossfadeStart[outputi] = fade;
+                           }
+
+                           size_t samples_left = nsamples - outputi;
+                           if (samples_left)
+                           {
+                              std::memcpy(pOutputCrossfadeStart + outputi, pNewWaveform + outputi, samples_left * sizeof(float));
+                           }
+                        }
+                     }
+
+                     return out;
+                  }
+               );
+
+               std::future_status status;
+
+               do {
+                  using namespace std::chrono_literals;
+                  status = audio_sr_channel_run_future.wait_for(0.1s);
+                  {
+                     std::lock_guard<std::mutex> guard(mProgMutex);
+                     mProgress->SetMessage(TranslatableString{ wxString(mProgMessage), {} });
+                     if (TotalProgress(mProgressFrac))
+                     {
+                        mIsCancelled = true;
                      }
                   }
 
-                  //first (or only) segment. No crossfade for this one.
-                  if (segmenti == 0)
-                  {
-                     std::memcpy(out->data() + offset, waveform_sr.data_ptr(), nsamples * sizeof(float));
-                  }
-                  else
-                  {
-                     float* pOutputCrossfadeStart = out->data() + offset;
-                     float* pNewWaveform = (float *)waveform_sr.data_ptr();
+               } while (status != std::future_status::ready);
 
-                     auto crossfade_samples = std::min(overlap_samples, nsamples);
-                     std::cout << "cross-fading " << crossfade_samples << " samples..." << std::endl;
-
-                     float fade_step = 1.f / (float)(overlap_samples);
-                     size_t outputi;
-                     for (outputi = 0; (outputi < crossfade_samples); outputi++)
-                     {
-                        float fade = pOutputCrossfadeStart[outputi] * (1 - outputi * fade_step) +
-                           pNewWaveform[outputi] * (outputi * fade_step);
-
-                        pOutputCrossfadeStart[outputi] = fade;
-                     }
-
-                     size_t samples_left = nsamples - outputi;
-                     if (samples_left)
-                     {
-                        std::memcpy(pOutputCrossfadeStart + outputi, pNewWaveform + outputi, samples_left * sizeof(float));
-                     }
-                  }
-               }
+               auto out = audio_sr_channel_run_future.get();
 
                output_channels.push_back(out);
             }

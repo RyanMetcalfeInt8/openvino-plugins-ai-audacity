@@ -5,6 +5,7 @@
 
 #include "effects/StatefulEffect.h"
 #include <wx/weakref.h>
+#include <mutex>
 
 class WaveTrack;
 class wxChoice;
@@ -84,6 +85,11 @@ private:
 
    int _ddim_steps_complete = 0;
    int _total_ddim_steps = 0;
+
+   std::mutex mProgMutex;
+   float mProgressFrac = 0.f;
+   std::string mProgMessage;
+   bool mIsCancelled = false;
 
    DECLARE_EVENT_TABLE()
 };
