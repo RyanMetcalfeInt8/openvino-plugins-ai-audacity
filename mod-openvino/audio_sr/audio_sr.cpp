@@ -83,15 +83,11 @@ std::pair< torch::Tensor, torch::Tensor> AudioSR::_mel_spectrogram_train(torch::
       torch::nn::functional::PadFuncOptions({ (filter_length - hop_length) / 2, (filter_length - hop_length) / 2 }).mode(torch::kReflect)
    ).squeeze(1);
 
-
    auto stft_spec = torch::stft(y, filter_length, hop_length, win_length, hann_window, false, "reflect", false, true, true);
 
    stft_spec = torch::abs(stft_spec);
 
    auto mel = spectral_normalize_torch(torch::matmul(mel_basis, stft_spec));
-
-   std::cout << "mel shape = " << mel.sizes() << std::endl;
-   std::cout << "stft_spec shape = " << stft_spec.sizes() << std::endl;
 
    return { mel.index({0}), stft_spec.index({0}) };
 }

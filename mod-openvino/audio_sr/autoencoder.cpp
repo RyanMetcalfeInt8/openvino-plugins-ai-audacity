@@ -103,7 +103,7 @@ std::shared_ptr< DiagonalGaussianDistribution > AutoEncoder::encode(torch::Tenso
 
     //std::cout << "moments_ov_tensor shape = " << moments_ov_tensor.get_shape() << std::endl;
 
-    auto moments = wrap_ov_tensor_as_torch(moments_ov_tensor);
+    auto moments = wrap_ov_tensor_as_torch(moments_ov_tensor).clone();
 
     //std::cout << "Saving moments_ov.raw, which has shape = " << moments.sizes() << std::endl;
     //dump_tensor(moments, "moments_ov.raw");

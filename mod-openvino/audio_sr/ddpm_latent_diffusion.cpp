@@ -116,7 +116,7 @@ std::pair<torch::Tensor, torch::Tensor> DDPMLatentDiffusion::_get_input(Batch& b
 
         _vae_feature_extract_infer.set_input_tensor(xc_ov);
         _vae_feature_extract_infer.infer();
-        c = wrap_ov_tensor_as_torch(_vae_feature_extract_infer.get_output_tensor());
+        c = wrap_ov_tensor_as_torch(_vae_feature_extract_infer.get_output_tensor()).clone();
     }
 
     return { z, c };

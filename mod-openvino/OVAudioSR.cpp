@@ -232,7 +232,6 @@ static std::vector<WaveTrack::Holder> CreateSourceTracks
 
 static bool AudioSRCallback(int ith_step_complete, void* user)
 {
-   std::cout << "AudioSRCallback: ith_step_complete = " << ith_step_complete << std::endl;
    EffectOVAudioSR* audio_sr = (EffectOVAudioSR*)user;
    return audio_sr->StepComplete(ith_step_complete);
 }
@@ -389,29 +388,48 @@ struct OVAudioSRIntermediate
 
 static std::shared_ptr< OVAudioSRIntermediate > run_audiosr_stage1(float* pInput, size_t nsamples, WaveTrack::Holder pTrack, std::shared_ptr<AudioSR> audioSR, int64_t seed)
 {
-   auto intermediate = std::make_shared< OVAudioSRIntermediate >();
-
-   intermediate->audioSR = audioSR;
-   intermediate->seed = seed;
-   intermediate->input_rms = calc_rms(pInput, nsamples);
-   intermediate->lowpass_filtered = normalize_pad_lowpass(pInput, nsamples, pTrack, intermediate->audioSR, intermediate->batch);
-   intermediate->batch.waveform_lowpass = torch::from_blob((void*)intermediate->lowpass_filtered->data(), { 1, static_cast<long>(intermediate->lowpass_filtered->size()) }, torch::kFloat);
-   intermediate->intermediate = audioSR->run_audio_sr_stage1(intermediate->batch, seed);
-
-   return intermediate;
+   try
+   {
+      auto intermediate = std::make_shared< OVAudioSRIntermediate >();
+      intermediate->audioSR = audioSR;
+      intermediate->seed = seed;
+      intermediate->input_rms = calc_rms(pInput, nsamples);
+      intermediate->lowpass_filtered = normalize_pad_lowpass(pInput, nsamples, pTrack, intermediate->audioSR, intermediate->batch);
+      intermediate->batch.waveform_lowpass = torch::from_blob((void*)intermediate->lowpass_filtered->data(), { 1, static_cast<long>(intermediate->lowpass_filtered->size()) }, torch::kFloat);
+      intermediate->intermediate = audioSR->run_audio_sr_stage1(intermediate->batch, seed);
+      return intermediate;
+   }
+   catch (const std::exception& error) {
+      std::cout << "exception in stage 1: " << error.what() << std::endl;
+      return {};
+   }
 }
 
+static std::future< std::shared_ptr< OVAudioSRIntermediate >> run_audiosr_stage1_async(float* pInput, size_t nsamples, WaveTrack::Holder pTrack, std::shared_ptr<AudioSR> audioSR, int64_t seed)
+{
+   return std::async(std::launch::async, run_audiosr_stage1, pInput, nsamples, pTrack, audioSR, seed);
+}
 
 static std::shared_ptr< OVAudioSRIntermediate > run_audiosr_stage2(std::shared_ptr< OVAudioSRIntermediate > intermediate, double unconditional_guidance_scale = 3.5, int ddim_steps = 50, std::optional< CallbackParams > callback_params = {})
 {
    intermediate->intermediate = intermediate->audioSR->run_audio_sr_stage2(intermediate->intermediate, unconditional_guidance_scale, ddim_steps, intermediate->seed, callback_params);
-
    return intermediate;
+}
+
+static std::future< std::shared_ptr< OVAudioSRIntermediate >> run_audiosr_stage2_async(std::shared_ptr< OVAudioSRIntermediate > intermediate, double unconditional_guidance_scale = 3.5, int ddim_steps = 50, std::optional< CallbackParams > callback_params = {})
+{
+   return std::async(std::launch::async, run_audiosr_stage2, intermediate, unconditional_guidance_scale, ddim_steps, callback_params);
 }
 
 static torch::Tensor run_audiosr_stage3(std::shared_ptr< OVAudioSRIntermediate > intermediate)
 {
-   return intermediate->audioSR->run_audio_sr_stage3(intermediate->intermediate, intermediate->batch);
+   auto ret = intermediate->audioSR->run_audio_sr_stage3(intermediate->intermediate, intermediate->batch);
+   return ret;
+}
+
+static std::future< torch::Tensor > run_audiosr_stage3_async(std::shared_ptr< OVAudioSRIntermediate > intermediate)
+{
+   return std::async(std::launch::async, run_audiosr_stage3, intermediate);
 }
 
 bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
@@ -661,7 +679,7 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
                }
 
                auto audio_sr_channel_run_future = std::async(std::launch::async,
-                  [this, &entire_input, &total_samples , &ddim_steps, &seed, &unconditional_guidance_scale, &pTrack]
+                  [this, &entire_input, &total_samples, &ddim_steps, &seed, &unconditional_guidance_scale, &pTrack]
                   {
                      std::shared_ptr< std::vector<float> > out = std::make_shared< std::vector<float> >(total_samples);
 
@@ -698,19 +716,178 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
                      _ddim_steps_complete = 0;
                      _total_ddim_steps = ddim_steps * segments.size();
 
+#if 1
+                     if (segments.size() > 0)
+                     {
+                        std::future< std::shared_ptr< OVAudioSRIntermediate >> intermediate_fut[3];
+                        std::shared_ptr< OVAudioSRIntermediate > intermediate[3];
+
+                        //fill the pipeline
+                        {
+                           size_t offset = segments[0].first;
+                           size_t nsamples = segments[0].second;
+
+                           float* pInput = entire_input.get() + offset;
+                           intermediate_fut[0] = run_audiosr_stage1_async(pInput, nsamples, pTrack, _audioSR, seed);
+                        }
+
+                        //wait for first stage1 to complete.
+                        intermediate[0] = intermediate_fut[0].get();
+
+                        //kick off stage 2 for 0
+                        intermediate_fut[0] = run_audiosr_stage2_async(intermediate[0], unconditional_guidance_scale, ddim_steps, callback_params);
+
+                        //hack -- commenting this causes corruption for the first 10 seconds.
+                        //intermediate_fut[0].wait();
+
+                        //kick off stage 1 for 1
+                        if (segments.size() > 1)
+                        {
+                           size_t offset = segments[1].first;
+                           size_t nsamples = segments[1].second;
+
+                           float* pInput = entire_input.get() + offset;
+                           intermediate_fut[1] = run_audiosr_stage1_async(pInput, nsamples, pTrack, _audioSR, seed);
+                        }
+
+                        //wait for both to complete.
+                        intermediate[0] = intermediate_fut[0].get();
+                        if (intermediate_fut[1].valid())
+                        {
+                           intermediate[1] = intermediate_fut[1].get();
+                        }
+
+                        //loop should start here...
+                        for (size_t segmenti = 0; segmenti < segments.size(); segmenti++)
+                        {
+                           int stage_3_index = segmenti % 3;
+                           int stage_2_index = (segmenti + 1) % 3;
+                           int stage_1_index = (segmenti + 2) % 3;
+
+                           //run stage 3
+                           auto stage_3_fut = run_audiosr_stage3_async(intermediate[stage_3_index]);
+
+                           //hack
+                           //stage_3_fut.wait();
+
+                           //run stage 2
+                           if (intermediate[stage_2_index])
+                           {
+                              intermediate_fut[stage_2_index] = run_audiosr_stage2_async(intermediate[stage_2_index], unconditional_guidance_scale, ddim_steps, callback_params);
+
+                              //hack
+                              //intermediate_fut[stage_2_index].wait();
+                           }
+
+                           //run stage 1
+                           if (segments.size() > (segmenti + 2))
+                           {
+                              size_t offset = segments[segmenti + 2].first;
+                              size_t nsamples = segments[segmenti + 2].second;
+
+                              float* pInput = entire_input.get() + offset;
+                              intermediate_fut[stage_1_index] = run_audiosr_stage1_async(pInput, nsamples, pTrack, _audioSR, seed);
+
+                              //hack
+                              //intermediate_fut[stage_1_index].wait();
+                           }
+
+                           //wait for all to complete
+
+                           //stage 3
+                           auto waveform_sr = stage_3_fut.get();
+
+                           //stage 2
+                           if (intermediate_fut[stage_2_index].valid())
+                           {
+                              intermediate[stage_2_index] = intermediate_fut[stage_2_index].get();
+                           }
+
+                           //stage 1
+                           if (intermediate_fut[stage_1_index].valid())
+                           {
+                              intermediate[stage_1_index] = intermediate_fut[stage_1_index].get();
+                           }
+
+                           auto input_rms = intermediate[stage_3_index]->input_rms;
+
+                           // clear stage3 position
+                           intermediate[stage_3_index] = {};
+                           intermediate_fut[stage_3_index] = {};
+
+                           size_t offset = segments[segmenti].first;
+                           size_t nsamples = segments[segmenti].second;
+
+                           auto output_rms = calc_rms((float*)waveform_sr.data_ptr(), nsamples);
+
+                           float ratio = input_rms / output_rms;
+
+                           //normalize loudness back to original RMS
+                           {
+                              float* pSamples = (float*)waveform_sr.data_ptr();
+                              for (size_t si = 0; si < nsamples; si++)
+                              {
+                                 pSamples[si] *= ratio;
+                              }
+                           }
+
+                           //first (or only) segment. No crossfade for this one.
+                           if (segmenti == 0)
+                           {
+                              std::memcpy(out->data() + offset, waveform_sr.data_ptr(), nsamples * sizeof(float));
+                           }
+                           else
+                           {
+                              float* pOutputCrossfadeStart = out->data() + offset;
+                              float* pNewWaveform = (float*)waveform_sr.data_ptr();
+
+                              auto crossfade_samples = std::min(overlap_samples, nsamples);
+                              std::cout << "cross-fading " << crossfade_samples << " samples..." << std::endl;
+
+                              float fade_step = 1.f / (float)(overlap_samples);
+                              size_t outputi;
+                              for (outputi = 0; (outputi < crossfade_samples); outputi++)
+                              {
+                                 float fade = pOutputCrossfadeStart[outputi] * (1 - outputi * fade_step) +
+                                    pNewWaveform[outputi] * (outputi * fade_step);
+
+                                 pOutputCrossfadeStart[outputi] = fade;
+                              }
+
+                              size_t samples_left = nsamples - outputi;
+                              if (samples_left)
+                              {
+                                 std::memcpy(pOutputCrossfadeStart + outputi, pNewWaveform + outputi, samples_left * sizeof(float));
+                              }
+                           }
+                        } 
+                     }
+
+#else
                      for (size_t segmenti = 0; segmenti < segments.size(); segmenti++)
                      {
                         size_t offset = segments[segmenti].first;
                         size_t nsamples = segments[segmenti].second;
 
+#if 1
+                        float* pInput = entire_input.get() + offset;
+                        std::cout << "pInput should be " << (void*)(pInput) << std::endl;
+                        auto stage1_fut = run_audiosr_stage1_async(pInput, nsamples, pTrack, _audioSR, seed);
+                        auto intermediate = stage1_fut.get();
+
+                        auto stage2_fut = run_audiosr_stage2_async(intermediate, unconditional_guidance_scale, ddim_steps, callback_params);
+                        intermediate = stage2_fut.get();
+
+                        auto stage3_fut = run_audiosr_stage3_async(intermediate);
+                        auto waveform_sr = stage3_fut.get();
+#else
                         auto intermediate = run_audiosr_stage1(entire_input.get() + offset, nsamples, pTrack, _audioSR, seed);
                         intermediate = run_audiosr_stage2(intermediate, unconditional_guidance_scale, ddim_steps, callback_params);
                         auto waveform_sr = run_audiosr_stage3(intermediate);
-
+#endif
                         auto input_rms = intermediate->input_rms;
 
                         auto output_rms = calc_rms((float*)waveform_sr.data_ptr(), nsamples);
-                        std::cout << "output_rms = " << input_rms << std::endl;
 
                         float ratio = input_rms / output_rms;
 
@@ -753,6 +930,7 @@ bool EffectOVAudioSR::Process(EffectInstance&, EffectSettings&)
                            }
                         }
                      }
+#endif
 
                      return out;
                   }

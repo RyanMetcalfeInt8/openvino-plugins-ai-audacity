@@ -239,14 +239,10 @@ torch::Tensor DDIMSampler::sample(int64_t ddim_num_steps,
 
     auto total_steps = timesteps.size(0);
 
-    std::cout << "total_steps = " << total_steps << std::endl;
     for (size_t i = 0; i < total_steps; i++)
     {
         auto index = total_steps - i - 1;
         auto step = timesteps[index];
-
-        std::cout << "i = " << i << std::endl;
-        std::cout << "step = " << step.item<int64_t>() << std::endl;
 
         auto sample_ddim_ret = _p_sample_ddim(img, conditioning, step.item<int64_t>(), index,
            unconditional_guidance_scale, gen, unconditional_conditioning, callback_params);
