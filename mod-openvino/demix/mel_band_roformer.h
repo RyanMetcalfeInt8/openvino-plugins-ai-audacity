@@ -15,6 +15,8 @@ namespace ov_demix
             const std::string& cache_dir = "",
             DemixModel::PadMode pad_mode = DemixModel::PadMode::Constant0);
 
+        virtual ~MelBandRoformer();
+
         torch::Tensor run(torch::Tensor arr) override;
         int64_t chunk_size() override { return 352800; }
         int64_t num_instruments() override { return 1; }

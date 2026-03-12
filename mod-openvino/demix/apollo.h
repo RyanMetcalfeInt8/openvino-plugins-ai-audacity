@@ -11,6 +11,8 @@ namespace ov_demix
     {
     public:
 
+       virtual ~Apollo();
+
         Apollo(const std::string& model_dir,
             const std::string& device,
             const std::string& cache_dir = "");
@@ -23,7 +25,9 @@ namespace ov_demix
 
     private:
 
+        ov::InferRequest _pre_ir;
         ov::InferRequest _forward_ir;
+        ov::InferRequest _post_ir;
 
         int64_t _hop_len;
         int64_t _win_len;
